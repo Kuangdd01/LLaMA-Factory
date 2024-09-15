@@ -168,6 +168,8 @@ def patch_target_modules(
             return "^(?!.*vision_tower).*(?:{}).*".format("|".join(target_modules))
         elif model_type == "qwen2_vl":
             return "^(?!.*visual).*(?:{}).*".format("|".join(target_modules))
+        elif model_type == "internvl_2":
+            return "^(?!.*vision_model).*(?:{}).*".format("|".join(target_modules))
         else:
             return target_modules
     else:

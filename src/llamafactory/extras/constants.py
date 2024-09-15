@@ -662,6 +662,17 @@ register_model_group(
 
 register_model_group(
     models={
+        "InternVL2-8B-Chat": {
+            DownloadSource.DEFAULT: "OpenGVLab/InternVL2-8B",
+        }
+    },
+    template="intern2_vl",
+    vision=True,
+)
+
+
+register_model_group(
+    models={
         "Jamba-v0.1": {
             DownloadSource.DEFAULT: "ai21labs/Jamba-v0.1",
             DownloadSource.MODELSCOPE: "AI-ModelScope/Jamba-v0.1",
@@ -1711,3 +1722,4 @@ register_model_group(
     },
     template="zephyr",
 )
+

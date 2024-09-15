@@ -122,8 +122,8 @@ def patch_model(
     ):
         gen_config.do_sample = True
 
-    if "GenerationMixin" not in str(model.generate.__func__):
-        model.generate = MethodType(PreTrainedModel.generate, model)
+    if model.config.model_type == "internvl_chat":
+        model.img_context_token_id = 92546
 
     if add_valuehead:
         prepare_valuehead_model(model)
@@ -168,3 +168,4 @@ def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
     setattr(model, "get_input_embeddings", MethodType(get_input_embeddings, model))
     setattr(model, "get_output_embeddings", MethodType(get_output_embeddings, model))
     setattr(model, "create_or_update_model_card", MethodType(create_or_update_model_card, model))
+

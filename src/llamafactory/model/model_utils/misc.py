@@ -44,6 +44,11 @@ def find_all_linear_modules(model: "PreTrainedModel", freeze_vision_tower: bool)
             forbidden_modules.add("visual")
         elif model_type == "chatglm":
             forbidden_modules.add("vision")
+        elif model_type == "internvl_chat":
+            forbidden_modules.add("vision_model")
+            forbidden_modules.add("1")
+            forbidden_modules.add("3")
+
         else:
             forbidden_modules.add("vision_tower")
 

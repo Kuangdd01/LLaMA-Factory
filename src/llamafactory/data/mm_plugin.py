@@ -1,3 +1,5 @@
+import torch
+
 from copy import deepcopy
 from io import BytesIO
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -19,7 +21,6 @@ if is_pyav_available():
 
 
 if TYPE_CHECKING:
-    import torch
     from numpy.typing import NDArray
     from transformers import PreTrainedTokenizer, ProcessorMixin
     from transformers.image_processing_utils import BaseImageProcessor
@@ -137,6 +138,8 @@ def _get_paligemma_token_type_ids(
 
     return batch_token_type_ids
 
+def _get_internvl2_image_flags(pixel_values):
+    pass
 
 class BasePlugin:
     def __init__(self, image_token: Optional[str], video_token: Optional[str]) -> None:
@@ -418,12 +421,148 @@ class Glm4vPlugin(BasePlugin):
         return {"_images": self.transform(images[0])}
 
 
+class InternVL2Plugin(BasePlugin):
+    image_size = 448
+    num_image_token = int((image_size // 14) ** 2 * (0.5 ** 2))
+
+    def __init__(self, image_token: Optional[str], video_token: Optional[str]) -> None:
+        super().__init__(image_token, video_token)
+        self.transform = transforms.Compose([
+            transforms.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            transforms.Resize((self.image_size, self.image_size), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        ])
+
+    @staticmethod
+    def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size) -> Tuple[int, int]:
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+    
+    @staticmethod
+    def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False) -> List["ImageInput"]:
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # calculate the existing image aspect ratio
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+            i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # find the closest aspect ratio to the target
+        target_aspect_ratio = InternVL2Plugin.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+        # calculate the target width and height
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        # resize the image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+    
+    def _get_mm_inputs(
+        self,
+        images: Sequence["ImageInput"],
+    ) -> Tuple["torch.Tensor", List[int]]:
+        images = [Image.open(image) if isinstance(image, str) else image for image in images]
+        pixel_values = []
+        image_indices = []
+        for image in images:
+            for splited_image in InternVL2Plugin.dynamic_preprocess(image, image_size=self.image_size, use_thumbnail=True):
+                pixel_values.append(self.transform(splited_image))
+            image_indices.append(len(pixel_values))
+        pixel_values = torch.stack(pixel_values)
+
+        return pixel_values, image_indices
+    
+    def process_messages(
+        self,
+        messages: Sequence[Dict[str, str]],
+        images: Sequence["ImageInput"],
+        videos: Sequence["VideoInput"],
+        processor: Optional["ProcessorMixin"],
+    ) -> List[Dict[str, str]]:
+        num_images = 0
+        result_messages = []
+
+        pixel_values, image_indices = self._get_mm_inputs(images)
+        num_patches_list = []
+        last_index = 0
+        for image_index in image_indices:
+            num_patches_list.append(pixel_values[last_index:image_index].shape[0])
+            last_index = image_index
+
+        for message in messages:
+            result_message = deepcopy(message)
+
+            content = deepcopy(message["content"])
+            while IMAGE_PLACEHOLDER in content:
+                if num_images >= len(images):
+                    raise ValueError("`len(images)` is less than the number of {} tokens.".format(IMAGE_PLACEHOLDER))
+
+                content = content.replace(
+                    IMAGE_PLACEHOLDER,
+                    f"<img>{'<IMG_CONTEXT>' * self.num_image_token * num_patches_list[num_images]}</img>",
+                    1,
+                )
+                num_images += 1
+
+            result_message["content"] = content
+            result_messages.append(result_message)
+
+        if len(images) != num_images:
+            raise ValueError("The number of images does not match the number of {} tokens".format(IMAGE_PLACEHOLDER))
+        return result_messages
+    
+    def get_mm_inputs(
+        self,
+        images: Sequence["ImageInput"],
+        videos: Sequence["VideoInput"],
+        imglens: Sequence[int],
+        vidlens: Sequence[int],
+        seqlens: Sequence[int],
+        processor: Optional["ProcessorMixin"],
+    ) -> Dict[str, Union[List[int], "torch.Tensor"]]:
+        pixel_values, _ = self._get_mm_inputs(images)
+        return {"pixel_values": pixel_values}
+
+
 PLUGINS = {
     "base": BasePlugin,
     "llava": LlavaPlugin,
     "paligemma": PaliGemmaPlugin,
     "qwen2_vl": Qwen2vlPlugin,
     "glm4v": Glm4vPlugin,
+    "intern2_vl": InternVL2Plugin,
 }
 
 
@@ -437,3 +576,4 @@ def get_mm_plugin(
         raise ValueError("Multimodal plugin `{}` not found.".format(name))
 
     return plugin_class(image_token, video_token)
+
